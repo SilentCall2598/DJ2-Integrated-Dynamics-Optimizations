@@ -1,0 +1,9 @@
+[
+  {
+    "modid": "${modid}",
+    "name": "${modname}",
+    "description": "Targeted performance optimizations for the Integrated Dynamics ecosystem.",
+    "version": "${version}",
+    "mcversion": "${mcversion}"
+  }
+]

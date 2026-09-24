@@ -1,8 +1,12 @@
-# DJ2 Integrated Dynamics Optimizations
+# Integrated Dynamics Optimizations
 
-Targeted performance optimizations for Integrated Dynamics in Divine Journey 2.
+A targeted performance optimization mod for the Integrated Dynamics ecosystem.
 
-## Target environment
+Initial development and validation happen in Divine Journey 2 on
+Minecraft 1.12.2. The project name and scope are intentionally broader than
+that single modpack.
+
+## Initial target environment
 
 - Minecraft 1.12.2
 - Forge 14.23.5.2860
@@ -17,8 +21,11 @@ Targeted performance optimizations for Integrated Dynamics in Divine Journey 2.
 
 Early development.
 
-The first investigation targets the failed-transfer cache used by
+The first investigation focuses on the failed-transfer cache used by
 `TunnelHelpers.moveSingleStateOptimized`.
 
-The current phase is measurement and verification only. No production
-optimization has been enabled yet.
+The current phase is measurement and verification. No production optimization
+is enabled yet.
+
+Future targets will be selected from measured performance data rather than
+assumed from the wider Integrated Dynamics scope.

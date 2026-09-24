@@ -1,0 +1,437 @@
+import groovy.json.JsonSlurper
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.jar.Manifest
+import java.util.zip.ZipFile
+
+plugins {
+    id 'com.gtnewhorizons.retrofuturagradle' version '2.0.2'
+    id 'java'
+}
+
+group   = project.mod_group
+version = project.mod_version
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+}
+
+minecraft {
+    mcVersion = project.minecraft_version
+    mcpMappingChannel = project.mcp_mapping_channel
+    mcpMappingVersion = project.mcp_mapping_version
+}
+
+repositories {
+    maven {
+        name = 'CleanroomMC'
+        url = 'https://maven.cleanroommc.com'
+        mavenContent { includeGroup 'zone.rong' }
+    }
+    mavenCentral()
+}
+
+def pinnedDependencies = [
+        [property: 'integrateddynamics_jar', jar: 'IntegratedDynamics-1.12.2-1.1.11.jar',
+         sha256: '88d3da662fc35c6709d0dc6931682318bb84964e169819fa8291e2f41451b5f1'],
+        [property: 'integratedtunnels_jar', jar: 'IntegratedTunnels-1.12.2-1.6.14.jar',
+         sha256: '4bd7652951fcdc81fcfa29ae5e91926796e17395bb33599e4d1e7f53deed1b56'],
+        [property: 'cyclopscore_jar', jar: 'CyclopsCore-1.12.2-1.6.7.jar',
+         sha256: '613b513fee6089cac67bf497ab823416bea0e10764e5395c49ac935d5ebf9f44'],
+        [property: 'commoncapabilities_jar', jar: 'CommonCapabilities-1.12.2-2.4.8.jar',
+         sha256: '71e7ed804a6d9f25c4c9af5e46c3e362a5c3b43919b2d3a276a57fd25d98776f'],
+        [property: 'integratednbt_jar', jar: 'integratednbt-1.2.2.jar',
+         sha256: '4e0dc8eb527ed2eba55697ac109337805f2eda366ad120c9c58fd769d1c33179'],
+        [property: 'integratedderivative_jar', jar: 'integratedderivative-1.1.2.jar',
+         sha256: 'd3f85306d236f3d57f6cbe7c0d3a56c77cd4fb59d41d132df8cf1578fde05cbe']
+]
+
+def libsDir = file('libs')
+def configuredJars = pinnedDependencies.collectEntries { dep ->
+    [(dep.property): project.findProperty(dep.property)?.toString()?.trim()]
+}
+
+configurations {
+    pinnedCompileOnly
+    compileOnly.extendsFrom(pinnedCompileOnly)
+}
+
+dependencies {
+    String mixinBooter = modUtils.enableMixins(
+            "zone.rong:mixinbooter:${project.mixinbooter_version}",
+            "${project.mod_id}.mixins.refmap.json")
+    api(mixinBooter) { transitive = false }
+    annotationProcessor(mixinBooter) { transitive = false }
+
+    annotationProcessor 'org.ow2.asm:asm-debug-all:5.2'
+    annotationProcessor 'com.google.guava:guava:32.1.2-jre'
+    annotationProcessor 'com.google.code.gson:gson:2.8.9'
+
+    pinnedCompileOnly files(pinnedDependencies.collect { dep -> new File(libsDir, "${configuredJars[dep.property]}") })
+}
+
+def sha256Of = { File f ->
+    MessageDigest digest = MessageDigest.getInstance('SHA-256')
+    f.withInputStream { stream ->
+        byte[] buffer = new byte[65536]
+        int read
+        while ((read = stream.read(buffer)) != -1) {
+            digest.update(buffer, 0, read)
+        }
+    }
+    digest.digest().encodeHex().toString()
+}
+
+tasks.register('verifyLocalDependencies') {
+    group = 'verification'
+    description = 'Verifies the exact filename and SHA-256 of every pinned compile-only jar in libs/.'
+    doLast {
+        Set<String> present = ((libsDir.list() ?: new String[0]) as List<String>) as Set<String>
+        List<String> problems = []
+        List<String> verified = []
+        pinnedDependencies.each { dep ->
+            String configured = configuredJars[dep.property]
+            if (!configured) {
+                problems << "${dep.property} is not set in gradle.properties (expected ${dep.jar})"
+            } else if (configured != dep.jar) {
+                problems << "${dep.property} is ${configured} but the pinned dependency is ${dep.jar}"
+            } else if (!present.contains(configured)) {
+                problems << "libs/${configured} does not exist"
+            } else {
+                String actual = sha256Of(new File(libsDir, configured))
+                if (actual != dep.sha256) {
+                    problems << "SHA-256 mismatch for libs/${configured}\n" +
+                            "      expected ${dep.sha256}\n" +
+                            "      actual   ${actual}"
+                } else {
+                    verified << "libs/${configured}  SHA-256 ${actual}"
+                }
+            }
+        }
+        if (!problems.isEmpty()) {
+            List<String> jars = present.findAll { it.endsWith('.jar') }.sort()
+            throw new GradleException('Pinned dependency verification failed:\n  ' + problems.join('\n  ') +
+                    '\nlibs/ currently holds: ' + (jars.isEmpty() ? '(no jars)' : jars.join(', ')) +
+                    '\nNo jar was replaced, downloaded, renamed, or modified.')
+        }
+        verified.each { logger.lifecycle("Verified ${it}") }
+        logger.lifecycle("All ${verified.size()} pinned dependency SHA-256 hashes matched.")
+    }
+}
+
+tasks.named('compileJava') {
+    dependsOn 'verifyLocalDependencies'
+}
+
+def modId = project.mod_id
+def modName = project.mod_name
+def modVersion = project.mod_version
+def mcVersion = project.minecraft_version
+
+tasks.register('verifyVersionConsistency') {
+    group = 'verification'
+    description = 'Verifies that Constants.VERSION exactly equals mod_version in gradle.properties.'
+    def constants = file('src/main/java/idopt/core/Constants.java')
+    doLast {
+        if (!constants.isFile()) {
+            throw new GradleException("Missing ${constants}")
+        }
+        List<String> values = (constants.getText('UTF-8') =~ /\bVERSION\s*=\s*"([^"]*)"\s*;/).collect { it[1] }
+        if (values.size() != 1) {
+            throw new GradleException("Expected exactly one VERSION string constant in ${constants}, found ${values.size()}")
+        }
+        if (values[0] != modVersion) {
+            throw new GradleException("Constants.VERSION is \"${values[0]}\" but mod_version is \"${modVersion}\"")
+        }
+        logger.lifecycle("Constants.VERSION matches mod_version ${modVersion}")
+    }
+}
+
+def projectRoot = projectDir
+def hygieneRequiredFiles = ['README.md', 'LICENSE', '.gitignore', '.gitattributes', 'gradle.properties',
+                            'gradle/wrapper/gradle-wrapper.properties', 'settings.gradle', 'build.gradle']
+def hygieneRequiredTrees = ['src']
+def hygieneOptionalTrees = ['tools']
+
+tasks.register('verifyProjectHygiene') {
+    group = 'verification'
+    description = 'Rejects non-ASCII and control characters in project-owned source, build, and documentation files.'
+    doLast {
+        def relative = { File f -> projectRoot.toPath().relativize(f.toPath()).toString().replace('\\', '/') }
+        List<String> problems = []
+        Set<File> scanned = new TreeSet<File>()
+        hygieneRequiredFiles.each { name ->
+            File f = new File(projectRoot, name)
+            if (f.isFile()) {
+                scanned << f
+            } else {
+                problems << "${name} is missing"
+            }
+        }
+        projectRoot.listFiles().findAll { it.isFile() && it.name.endsWith('.gradle') }.each { scanned << it }
+        (hygieneRequiredTrees + hygieneOptionalTrees).each { name ->
+            File dir = new File(projectRoot, name)
+            if (dir.isDirectory()) {
+                dir.eachFileRecurse(groovy.io.FileType.FILES) { scanned << it }
+            } else if (hygieneRequiredTrees.contains(name)) {
+                problems << "${name}/ is missing"
+            }
+        }
+        scanned.each { f ->
+            String text
+            try {
+                text = StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(f.bytes)).toString()
+            } catch (CharacterCodingException ignored) {
+                problems << "${relative(f)}: not valid UTF-8"
+                return
+            }
+            int line = 1
+            int column = 0
+            int offset = 0
+            while (offset < text.length()) {
+                int cp = text.codePointAt(offset)
+                offset += Character.charCount(cp)
+                if (cp == 0x0A) {
+                    line++
+                    column = 0
+                    continue
+                }
+                column++
+                if (cp == 0x0D || cp == 0x09) {
+                    continue
+                }
+                if (cp < 0x20 || cp > 0x7E) {
+                    problems << "${relative(f)}:${line}:${column}: U+${String.format('%04X', cp)}"
+                }
+            }
+        }
+        if (!problems.isEmpty()) {
+            throw new GradleException('Project hygiene check failed:\n  ' + problems.join('\n  '))
+        }
+        logger.lifecycle("Scanned ${scanned.size()} project-owned files: all printable ASCII.")
+        scanned.each { logger.info("  ${relative(it)}") }
+    }
+}
+
+tasks.named('processResources', ProcessResources) {
+    def expansion = [modid: modId, modname: modName, version: modVersion, mcversion: mcVersion]
+    inputs.properties(expansion)
+    filesMatching('mcmod.info') {
+        expand(expansion)
+    }
+}
+
+tasks.named('jar', Jar) {
+    manifest {
+        attributes(
+                'Implementation-Title'  : modName,
+                'Implementation-Version': modVersion
+        )
+    }
+}
+
+tasks.withType(AbstractArchiveTask).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+def reobfJarTask = tasks.named('reobfJar', AbstractArchiveTask)
+def releaseJarFile = reobfJarTask.flatMap { it.archiveFile }
+def releaseArchivesName = base.archivesName
+def pinnedJarFiles = pinnedDependencies.collect { dep -> new File(libsDir, dep.jar) }
+def modPackageRoot = 'idopt/'
+def requiredModEntries = ['META-INF/MANIFEST.MF', 'mcmod.info',
+                          'idopt/IntegratedDynamicsOptimizations.class', 'idopt/core/Constants.class']
+def nonReleaseRootDirs = ['references/', 'logs/', 'run/', 'tools/', 'libs/', 'build/', 'src/', 'gradle/']
+def nonReleaseFileNames = ['gradlew', 'build.gradle', 'settings.gradle', 'gradle.properties', 'LICENSE']
+def nonReleaseSuffixes = ['.bat', '.cmd', '.log', '.md']
+def nestedArchiveSuffixes = ['.jar', '.zip', '.war', '.ear', '.jmod']
+def attributionKeys = ['authorList', 'authors', 'author', 'credits']
+def java8ClassMajor = 52
+
+tasks.register('auditReleaseJar') {
+    group = 'verification'
+    description = 'Audits the reobfuscated release jar contents, metadata, and bytecode level and prints its SHA-256.'
+    dependsOn reobfJarTask
+    doLast {
+        File artifact = releaseJarFile.get().asFile
+        String expectedName = "${releaseArchivesName.get()}-${modVersion}.jar"
+        List<String> problems = []
+        if (!artifact.isFile()) {
+            throw new GradleException("Release jar ${artifact} does not exist")
+        }
+        if (artifact.name != expectedName) {
+            problems << "release jar is named ${artifact.name}, expected ${expectedName}"
+        }
+
+        Map<String, String> thirdPartyPrefixes = [:]
+        Map<String, String> thirdPartyExact = [:]
+        pinnedJarFiles.each { jf ->
+            if (!jf.isFile()) {
+                throw new GradleException("Pinned jar ${jf} is missing; the third-party ownership check cannot run")
+            }
+            int ownedClasses = 0
+            new ZipFile(jf).withCloseable { zip ->
+                zip.entries().each { entry ->
+                    String n = entry.name
+                    if (entry.directory || n.startsWith('META-INF/')) {
+                        return
+                    }
+                    if (n.endsWith('.class')) {
+                        ownedClasses++
+                        int slash = n.lastIndexOf('/')
+                        if (slash < 0) {
+                            thirdPartyExact.putIfAbsent(n, jf.name)
+                        } else {
+                            thirdPartyPrefixes.putIfAbsent(n.substring(0, slash + 1), jf.name)
+                        }
+                    } else if (n.startsWith('assets/') && n.indexOf('/', 7) > 7) {
+                        thirdPartyPrefixes.putIfAbsent(n.substring(0, n.indexOf('/', 7) + 1), jf.name)
+                    }
+                }
+            }
+            if (ownedClasses == 0) {
+                throw new GradleException("Pinned jar ${jf.name} contains no classes; the third-party ownership check cannot run")
+            }
+        }
+
+        Set<String> entryNames = new LinkedHashSet<String>()
+        String manifestTitle = null
+        String manifestVersion = null
+        String modInfoText = null
+        int modClassCount = 0
+        int maxClassMajor = 0
+        new ZipFile(artifact).withCloseable { zip ->
+            zip.entries().each { entry ->
+                String n = entry.name
+                if (!entryNames.add(n)) {
+                    problems << "duplicate entry ${n}"
+                }
+                String lower = n.toLowerCase(Locale.ROOT)
+                String fileName = n.endsWith('/') ? '' : n.substring(n.lastIndexOf('/') + 1)
+                String owner = thirdPartyExact[n]
+                if (owner == null) {
+                    owner = thirdPartyPrefixes.find { prefix, jarName -> n.startsWith(prefix) }?.value
+                }
+                if (owner != null) {
+                    problems << "third-party entry ${n} belongs to ${owner}"
+                }
+                if (nestedArchiveSuffixes.any { lower.endsWith(it) } || lower.startsWith('meta-inf/jarjar/') ||
+                        lower.startsWith('meta-inf/libraries/')) {
+                    problems << "embedded archive ${n}"
+                }
+                if (n.split('/').any { it.startsWith('.') }) {
+                    problems << "hidden file or directory ${n}"
+                }
+                if (nonReleaseRootDirs.any { n.startsWith(it) } || nonReleaseFileNames.contains(fileName) ||
+                        nonReleaseSuffixes.any { lower.endsWith(it) }) {
+                    problems << "local-only or build file ${n}"
+                }
+                boolean isModEntry = n.startsWith(modPackageRoot)
+                boolean allowed = n == 'META-INF/' || n == 'META-INF/MANIFEST.MF' || n == 'mcmod.info' ||
+                        (isModEntry && (n.endsWith('/') || n.endsWith('.class')))
+                if (!allowed) {
+                    problems << "unexpected entry ${n}"
+                }
+                if (isModEntry && n.endsWith('.class')) {
+                    modClassCount++
+                    String simpleName = fileName.substring(0, fileName.length() - 6)
+                    int nested = simpleName.indexOf('$')
+                    String outerName = nested < 0 ? simpleName : simpleName.substring(0, nested)
+                    if (outerName.endsWith('Test') || outerName.endsWith('Tests') || n.contains('/test/') ||
+                            n.contains('/tests/') || n.contains('/tools/')) {
+                        problems << "test or tool class ${n}"
+                    }
+                    byte[] header = new byte[8]
+                    int headerRead = 0
+                    zip.getInputStream(entry).withCloseable { stream ->
+                        int r
+                        while (headerRead < 8 && (r = stream.read(header, headerRead, 8 - headerRead)) != -1) {
+                            headerRead += r
+                        }
+                    }
+                    long magic = ((header[0] & 0xFFL) << 24) | ((header[1] & 0xFFL) << 16) |
+                            ((header[2] & 0xFFL) << 8) | (header[3] & 0xFFL)
+                    int major = ((header[6] & 0xFF) << 8) | (header[7] & 0xFF)
+                    if (headerRead < 8 || magic != 0xCAFEBABEL) {
+                        problems << "invalid class file ${n}"
+                    } else {
+                        maxClassMajor = Math.max(maxClassMajor, major)
+                        if (major > java8ClassMajor) {
+                            problems << "class ${n} has major version ${major}, above Java 8 (${java8ClassMajor})"
+                        }
+                    }
+                }
+                if (n == 'META-INF/MANIFEST.MF') {
+                    zip.getInputStream(entry).withCloseable { stream ->
+                        def attributes = new Manifest(stream).mainAttributes
+                        manifestTitle = attributes.getValue('Implementation-Title')
+                        manifestVersion = attributes.getValue('Implementation-Version')
+                    }
+                }
+                if (n == 'mcmod.info') {
+                    modInfoText = zip.getInputStream(entry).withCloseable { it.getText('UTF-8') }
+                }
+            }
+        }
+
+        requiredModEntries.findAll { !entryNames.contains(it) }.each { problems << "missing required entry ${it}" }
+        if (manifestVersion != modVersion) {
+            problems << "manifest Implementation-Version is ${manifestVersion}, expected ${modVersion}"
+        }
+        if (manifestTitle != modName) {
+            problems << "manifest Implementation-Title is ${manifestTitle}, expected ${modName}"
+        }
+        if (modInfoText != null) {
+            if (modInfoText.contains('${')) {
+                problems << 'mcmod.info contains unexpanded placeholders'
+            }
+            def modInfo = null
+            try {
+                modInfo = new JsonSlurper().parseText(modInfoText)
+            } catch (Exception e) {
+                problems << "mcmod.info is not valid JSON: ${e.message}"
+            }
+            if (modInfo != null) {
+                if (!(modInfo instanceof List) || modInfo.size() != 1 || !(modInfo[0] instanceof Map)) {
+                    problems << 'mcmod.info must hold exactly one mod entry'
+                } else {
+                    Map info = (Map) modInfo[0]
+                    [modid: modId, name: modName, version: modVersion, mcversion: mcVersion].each { key, expected ->
+                        if (info[key] != expected) {
+                            problems << "mcmod.info ${key} is ${info[key]}, expected ${expected}"
+                        }
+                    }
+                    attributionKeys.findAll { info.containsKey(it) }.each { problems << "mcmod.info has attribution key ${it}" }
+                }
+            }
+        }
+
+        if (!problems.isEmpty()) {
+            throw new GradleException("Release jar audit failed for ${artifact.name}:\n  " + problems.join('\n  '))
+        }
+        logger.lifecycle("Release jar audit passed: ${entryNames.size()} entries, ${modClassCount} classes, " +
+                "max class major version ${maxClassMajor}")
+        logger.lifecycle("Jar     ${artifact.name}")
+        logger.lifecycle("Bytes   ${artifact.length()}")
+        logger.lifecycle("SHA-256 ${sha256Of(artifact)}")
+    }
+}
+
+tasks.named('check') {
+    dependsOn 'verifyVersionConsistency', 'verifyProjectHygiene', 'auditReleaseJar'
+}
+
+tasks.named('wrapper', Wrapper) {
+    gradleVersion = project.gradle_version
+    distributionType = Wrapper.DistributionType.BIN
+    distributionSha256Sum = '9c0f7faeeb306cb14e4279a3e084ca6b596894089a0638e68a07c945a32c9e14'
+}
